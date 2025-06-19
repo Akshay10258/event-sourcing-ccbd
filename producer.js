@@ -5,7 +5,7 @@ const fs = require('fs/promises');
 // Producer code that takes input from the user and sends it to the Kafka topic i.e emits the event 
 async function init() {
     //parse the json data
-    const rawData = await fs.readFile(path.join(__dirname, 'events1000.ndjson'), 'utf-8');
+    const rawData = await fs.readFile(path.join(__dirname, 'enriched_1000.ndjson'), 'utf-8');
     const lines = rawData.split('\n').filter(line => line.trim() !== '');
     const events = lines.map(line => JSON.parse(line));
 
@@ -34,6 +34,7 @@ async function init() {
         const auditEvent = {
             event_type: `${event_type}Audit`,
             account_id: event.account_id,
+            event_id:event.event_id,
             performed_by: 'system',
             timestamp: event.timestamp ?? new Date().toISOString(),
             original_event: event // Store the actual event payload for traceability
@@ -42,7 +43,7 @@ async function init() {
         topicBuckets['audit-events'].push(auditEvent);
     }
 
-    const batchSize = 500;
+    const batchSize = 200;
     // Send in batches of 500 to each topic parallely
     async function sendBatch(topic,bucket,producer) {
     for(let i=0;i<bucket.length;i+=batchSize){

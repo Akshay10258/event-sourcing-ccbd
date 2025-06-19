@@ -15,7 +15,7 @@ const pool = new Pool({
 });
 
 async function init() {
-  const consumer = kafka.consumer({ groupId: "read-model-updaters" });
+  const consumer = kafka.consumer({ groupId: "read-model-updaters11" });
   await consumer.connect();
 
   await consumer.subscribe({ topic: "account-events", fromBeginning: true });
@@ -23,80 +23,93 @@ async function init() {
   await consumer.subscribe({ topic: "audit-events", fromBeginning: true });
 
   
-await consumer.run({
-  eachMessage: async ({ topic, partition, message,heartbeat }) => {
-    const event = JSON.parse(message.value.toString());
-    const { account_id, name, event_type, amount, timestamp } = event;
+   await consumer.run({
+    eachMessage: async ({ topic, partition, message, heartbeat }) => {
+      // now destructure the new fields too:
+      const event = JSON.parse(message.value.toString());
+      const {
+        event_id,
+        transaction_id = null,
+        account_id,
+        name,
+        event_type,
+        amount,
+        timestamp
+      } = event;
 
-    if (topic === "account-events" && event_type === "AccountCreated") {
-      await pool.query(
-        `INSERT INTO users (account_id, name, event_type, balance, created_at)
-          VALUES ($1, $2, $3, $4, $5)
-          ON CONFLICT (account_id) DO NOTHING`,
-        [account_id, name, event_type, amount, new Date(timestamp)]
-      );
-      await heartbeat();
-      console.log(`Created user: ${name} (ID: ${account_id}) with ₹${amount}`);
-      logger.info(`Created user: ${name} (ID: ${account_id}) with ₹${amount}`);
-    }
-    else if (topic === "transaction-events") {
-      const select = await pool.query(
-        `SELECT balance FROM users WHERE account_id = $1`,
-        [account_id]
-      );
-      if (!select.rows.length) {
-        console.warn(`No user found for ID ${account_id}`);
-
-        // Log it to a file for later inspection
-        await fs.appendFile(
-          path.join(__dirname, 'missing_accounts.log'),
-          `${account_id} - ${event_type}\n`
+      if (topic === "account-events" && event_type === "AccountCreated") {
+        // assumes users table now has an event_id column
+        await pool.query(
+          `INSERT INTO users
+             (event_id, account_id, name, event_type, balance, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           ON CONFLICT (account_id) DO NOTHING`,
+          [ event_id, account_id, name, event_type, amount, new Date(timestamp) ]
         );
 
+        await heartbeat();
+        logger.info(`UserCreated: ${name} (ID:${account_id}) evt:${event_id}`);
         return;
       }
 
-      // force numeric math
-      const current    = parseFloat(select.rows[0].balance);
-      const amountNum  = Number(amount);
-      const delta      = (event_type === "MoneyDeposited" ? amountNum : -amountNum);
-      const newBalance = current + delta;
+      if (topic === "transaction-events") {
+        // pull current balance
+        const res = await pool.query(
+          `SELECT balance FROM users WHERE account_id = $1`,
+          [ account_id ]
+        );
+        if (res.rows.length === 0) {
+          // no account yet – log for later
+          await fs.appendFile(
+            path.join(__dirname, 'missing_accounts.log'),
+            `${new Date().toISOString()}  NO-USER  acc:${account_id} evt:${event_id}\n`
+          );
+          return;
+        }
 
-      await pool.query(
-        `UPDATE users SET balance = $1 WHERE account_id = $2`,
-        [newBalance, account_id]
-      );
-      await pool.query(
-        `INSERT INTO transactions
-          (account_id, transaction_type, amount, timestamp)
-        VALUES ($1,$2,$3,$4)`,
-        [account_id, event_type, amountNum, event.timestamp]
-      );
+        const current    = parseFloat(res.rows[0].balance);
+        const delta      = (event_type === "MoneyDeposited" ? +amount : -amount);
+        const newBalance = current + delta;
 
-      console.log(
-        `${event_type} ₹${amountNum} for ${account_id}. New balance: ₹${newBalance}`
-      );
+        // update users balance
+        await pool.query(
+          `UPDATE users
+              SET balance = $1
+            WHERE account_id = $2`,
+          [ newBalance, account_id ]
+        );
 
-      logger.info(
-        `${event_type} ₹${amountNum} for ${account_id}. New balance: ₹${newBalance}`
-      );
+        // insert into transactions, now storing event_id + transaction_id too
+        await pool.query(
+          `INSERT INTO transactions
+             (event_id, transaction_id, account_id, transaction_type, amount, timestamp)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [ event_id, transaction_id, account_id, event_type, amount, new Date(timestamp) ]
+        );
 
-      // finally heartbeat so Kafka knows you're still alive
+        await heartbeat();
+        logger.info(
+          `Txn ${event_type} ₹${amount} for ${account_id}. ` +
+          `evt:${event_id} txn:${transaction_id} newBal:₹${newBalance}`
+        );
+        return;
+      }
+
+      if (topic === "audit-events") {
+        const { event_type: auditType, account_id: acct, timestamp: ts, original_event } = event;
+        await pool.query(
+          `INSERT INTO audit_logs
+             (event_id, event_type, account_id, created_at, raw_event)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [ event_id, auditType, acct, new Date(ts), JSON.stringify(original_event) ]
+        );
+        await heartbeat();
+        logger.info(`Audit log: ${auditType} acc:${acct} evt:${event_id}`);
+        return;
+      }
+
+      // fallback heartbeat in case none of the above matched
       await heartbeat();
-    }
-    else if (topic === "audit-events") {
-      const { event_type: auditType, account_id: acct, timestamp: ts, original_event } = event;
-      await pool.query(
-        `INSERT INTO audit_logs (event_type, account_id, created_at, raw_event)
-        VALUES ($1, $2, $3, $4)`,
-        [auditType, acct, new Date(ts), JSON.stringify(original_event)]
-      );
-      await heartbeat();
-      console.log(`Audit log added: ${auditType} for ${acct}`);
-      logger.info(`Audit log added: ${auditType} for ${acct}`);
-    }
-    console.log(` [${topic}] PART:${partition} -> ${message.value.toString()}`);
-    await heartbeat();
     }
   });
 }
